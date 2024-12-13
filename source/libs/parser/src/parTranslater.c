@@ -8772,7 +8772,7 @@ static int32_t columnDefNodeToField(SNodeList* pList, SArray** pArray, bool calB
     } else {
       field.bytes = pCol->dataType.bytes;
     }
-
+    field.typeMod = calcTypeMod(&pCol->dataType);
     tstrncpy(field.name, pCol->colName, TSDB_COL_NAME_LEN);
     if (pCol->pOptions) {
       setColEncode(&field.compress, columnEncodeVal(((SColumnOptions*)pCol->pOptions)->encode));
@@ -8784,6 +8784,9 @@ static int32_t columnDefNodeToField(SNodeList* pList, SArray** pArray, bool calB
     }
     if (pCol->pOptions && ((SColumnOptions*)pCol->pOptions)->bPrimaryKey) {
       field.flags |= COL_IS_KEY;
+    }
+    if (field.typeMod > 0) {
+      field.flags |= COL_HAS_TYPE_MOD;
     }
     if (NULL == taosArrayPush(*pArray, &field)) {
       code = terrno;
@@ -8901,6 +8904,17 @@ static int32_t checkTableRollupOption(STranslateContext* pCxt, SNodeList* pFuncs
   return TSDB_CODE_SUCCESS;
 }
 
+static int32_t checkDecimalDataType(STranslateContext* pCxt, SDataType pDataType) {
+  if (IS_DECIMAL_TYPE(pDataType.type)) {
+    if (pDataType.precision < TSDB_DECIMAL_MIN_PRECISION || pDataType.precision > TSDB_DECIMAL_MAX_PRECISION ||
+        pDataType.precision < pDataType.scale) {
+      return generateSyntaxErrMsgExt(&pCxt->msgBuf, TSDB_CODE_PAR_INVALID_COLUMN,
+                                     "Invalid column type: %s, invalid precision or scale");
+    }
+  }
+  return TSDB_CODE_SUCCESS;
+}
+
 static int32_t checkTableTagsSchema(STranslateContext* pCxt, SHashObj* pHash, SNodeList* pTags) {
   int32_t ntags = LIST_LENGTH(pTags);
   if (0 == ntags) {
@@ -8937,6 +8951,7 @@ static int32_t checkTableTagsSchema(STranslateContext* pCxt, SHashObj* pHash, SN
     } else {
       break;
     }
+    // TODO wjm can't create tag with decimal type
   }
 
   if (TSDB_CODE_SUCCESS == code && tagsSize > TSDB_MAX_TAGS_LEN) {
@@ -9000,12 +9015,16 @@ static int32_t checkTableColsSchema(STranslateContext* pCxt, SHashObj* pHash, in
       }
     }
 
-    if (TSDB_CODE_SUCCESS == code && isAggrRollup && 0 != colIndex) {
+    if (TSDB_CODE_SUCCESS == code && isAggrRollup && 0 != colIndex) { // TODO wjm, test is agg rollup
       if (pCol->dataType.type != TSDB_DATA_TYPE_FLOAT && pCol->dataType.type != TSDB_DATA_TYPE_DOUBLE) {
         code =
             generateSyntaxErrMsgExt(&pCxt->msgBuf, TSDB_CODE_PAR_INVALID_COLUMN,
                                     "Invalid column type: %s, only float/double allowed for %s", pCol->colName, pFunc);
       }
+    }
+
+    if (TSDB_CODE_SUCCESS == code && IS_DECIMAL_TYPE(pCol->dataType.type)) {
+      code = checkDecimalDataType(pCxt, pCol->dataType);
     }
 
     if (TSDB_CODE_SUCCESS == code) {
