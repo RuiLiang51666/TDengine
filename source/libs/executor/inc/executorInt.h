@@ -450,7 +450,8 @@ typedef struct STimeWindowAggSupp {
 } STimeWindowAggSupp;
 
 typedef struct SStreamNotifyEventSupp {
-  SArray*      pWindowEvents;      // Array of SStreamNotifyEvent, storing window events and trigger values.
+  SList*       pWindowEvents;      // List of SStreamNotifyEvent, storing window events and trigger values.
+  SHashObj*    pWindowEventHashMap;  // Hash map from gorupid+skey to the list node of window event.
   SHashObj*    pTableNameHashMap;  // Hash map from groupid to the dest child table name.
   SHashObj*    pResultHashMap;     // Hash map from groupid+skey to the window agg result.
   SSDataBlock* pEventBlock;        // The datablock contains all window events and results.
@@ -459,7 +460,7 @@ typedef struct SStreamNotifyEventSupp {
 typedef struct SSteamOpBasicInfo {
   int32_t                primaryPkIndex;
   bool                   updateOperatorInfo;
-  SStreamNotifyEventSupp windowEventSup;
+  SStreamNotifyEventSupp notifyEventSup;
 } SSteamOpBasicInfo;
 
 typedef struct SStreamFillSupporter {

@@ -30,12 +30,12 @@ extern "C" {
 #define FILL_POS_MID     2
 #define FILL_POS_END     3
 
-#define HAS_NON_ROW_DATA(pRowData)           (pRowData->key == INT64_MIN)
-#define HAS_ROW_DATA(pRowData)               (pRowData && pRowData->key != INT64_MIN)
+#define HAS_NON_ROW_DATA(pRowData) (pRowData->key == INT64_MIN)
+#define HAS_ROW_DATA(pRowData)     (pRowData && pRowData->key != INT64_MIN)
 
-#define IS_INVALID_WIN_KEY(ts)               ((ts) == INT64_MIN)
-#define IS_VALID_WIN_KEY(ts)               ((ts) != INT64_MIN)
-#define SET_WIN_KEY_INVALID(ts)              ((ts) = INT64_MIN)
+#define IS_INVALID_WIN_KEY(ts)  ((ts) == INT64_MIN)
+#define IS_VALID_WIN_KEY(ts)    ((ts) != INT64_MIN)
+#define SET_WIN_KEY_INVALID(ts) ((ts) = INT64_MIN)
 
 #define IS_NORMAL_INTERVAL_OP(op)                                    \
   ((op)->operatorType == QUERY_NODE_PHYSICAL_PLAN_STREAM_INTERVAL || \
@@ -43,7 +43,8 @@ extern "C" {
 
 #define IS_CONTINUE_INTERVAL_OP(op) ((op)->operatorType == QUERY_NODE_PHYSICAL_PLAN_STREAM_CONTINUE_INTERVAL)
 
-#define IS_FILL_CONST_VALUE(type) ((type == TSDB_FILL_NULL || type == TSDB_FILL_NULL_F || type == TSDB_FILL_SET_VALUE ||  type == TSDB_FILL_SET_VALUE_F))
+#define IS_FILL_CONST_VALUE(type) \
+  ((type == TSDB_FILL_NULL || type == TSDB_FILL_NULL_F || type == TSDB_FILL_SET_VALUE || type == TSDB_FILL_SET_VALUE_F))
 
 typedef struct SSliceRowData {
   TSKEY key;
@@ -57,11 +58,13 @@ typedef struct SSlicePoint {
   SRowBuffPos*   pResPos;
 } SSlicePoint;
 
-void setStreamOperatorState(SSteamOpBasicInfo* pBasicInfo, EStreamType type);
-bool needSaveStreamOperatorInfo(SSteamOpBasicInfo* pBasicInfo);
-void saveStreamOperatorStateComplete(SSteamOpBasicInfo* pBasicInfo);
+void    setStreamOperatorState(SSteamOpBasicInfo* pBasicInfo, EStreamType type);
+bool    needSaveStreamOperatorInfo(SSteamOpBasicInfo* pBasicInfo);
+void    saveStreamOperatorStateComplete(SSteamOpBasicInfo* pBasicInfo);
 int32_t initStreamBasicInfo(SSteamOpBasicInfo* pBasicInfo);
-void destroyStreamBasicInfo(SSteamOpBasicInfo* pBasicInfo);
+void    destroyStreamBasicInfo(SSteamOpBasicInfo* pBasicInfo);
+int32_t encodeStreamBasicInfo(void** buf, SSteamOpBasicInfo* pBasicInfo);
+int32_t decodeStreamBasicInfo(void** buf, SSteamOpBasicInfo* pBasicInfo);
 
 int64_t getDeleteMarkFromOption(SStreamNodeOption* pOption);
 void    removeDeleteResults(SSHashObj* pUpdatedMap, SArray* pDelWins);
@@ -112,6 +115,15 @@ TSKEY   compareTs(void* pKey);
 
 int32_t addEventAggNotifyEvent(EStreamNotifyEventType eventType, const SSessionKey* pSessionKey,
                                const SSDataBlock* pInputBlock, const SNodeList* pCondCols, int32_t ri,
+                               SStreamNotifyEventSupp* sup);
+int32_t addStateAggNotifyEvent(EStreamNotifyEventType eventType, const SSessionKey* pSessionKey,
+                               const SStateKeys* pCurState, const SStateKeys* pAnotherState,
+                               SStreamNotifyEventSupp* sup);
+int32_t addIntervalAggNotifyEvent(EStreamNotifyEventType eventType, const SSessionKey* pSessionKey,
+                                  SStreamNotifyEventSupp* sup);
+int32_t addSessionAggNotifyEvent(EStreamNotifyEventType eventType, const SSessionKey* pSessionKey,
+                                 SStreamNotifyEventSupp* sup);
+int32_t addCountAggNotifyEvent(EStreamNotifyEventType eventType, const SSessionKey* pSessionKey,
                                SStreamNotifyEventSupp* sup);
 int32_t addAggResultNotifyEvent(const SSDataBlock* pResultBlock, const SSchemaWrapper* pSchemaWrapper,
                                 SStreamNotifyEventSupp* sup);

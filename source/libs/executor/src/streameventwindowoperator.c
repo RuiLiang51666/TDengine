@@ -179,7 +179,7 @@ int32_t setEventOutputBuf(SStreamAggSupporter* pAggSup, TSKEY* pTs, uint64_t gro
   SSessionKey winKey = {.win.skey = ts, .win.ekey = ts, .groupId = groupId};
   code = pAggSup->stateStore.streamStateSessionAllocWinBuffByNextPosition(pAggSup->pState, pCur, &winKey, &pVal, &len);
   QUERY_CHECK_CODE(code, lino, _error);
-    (*pWinCode) = TSDB_CODE_FAILED;
+  (*pWinCode) = TSDB_CODE_FAILED;
 
   setEventWindowInfo(pAggSup, &winKey, pVal, pCurWin);
   pCurWin->pWinFlag->startFlag = start;
@@ -395,10 +395,11 @@ static void doStreamEventAggImpl(SOperatorInfo* pOperator, SSDataBlock* pSDataBl
                              &nextWinKey, &winCode);
     QUERY_CHECK_CODE(code, lino, _end);
 
-    if (BIT_FLAG_TEST_MASK(pTaskInfo->streamInfo.eventTypes, SNOTIFY_EVENT_WINDOW_OPEN) &&
-        *(bool*)colDataGetNumData(pColStart, i) && winCode != TSDB_CODE_SUCCESS) {
+    if (winCode != TSDB_CODE_SUCCESS &&
+        BIT_FLAG_TEST_MASK(pTaskInfo->streamInfo.eventTypes, SNOTIFY_EVENT_WINDOW_OPEN) &&
+        *(bool*)colDataGetNumData(pColStart, i)) {
       code = addEventAggNotifyEvent(SNOTIFY_EVENT_WINDOW_OPEN, &curWin.winInfo.sessionWin, pSDataBlock,
-                                    pInfo->pStartCondCols, i, &pInfo->basic.windowEventSup);
+                                    pInfo->pStartCondCols, i, &pInfo->basic.notifyEventSup);
       QUERY_CHECK_CODE(code, lino, _end);
     }
 
@@ -471,7 +472,7 @@ static void doStreamEventAggImpl(SOperatorInfo* pOperator, SSDataBlock* pSDataBl
 
     if (BIT_FLAG_TEST_MASK(pTaskInfo->streamInfo.eventTypes, SNOTIFY_EVENT_WINDOW_CLOSE)) {
       code = addEventAggNotifyEvent(SNOTIFY_EVENT_WINDOW_CLOSE, &curWin.winInfo.sessionWin, pSDataBlock,
-                                    pInfo->pEndCondCols, i + winRows - 1, &pInfo->basic.windowEventSup);
+                                    pInfo->pEndCondCols, i + winRows - 1, &pInfo->basic.notifyEventSup);
       QUERY_CHECK_CODE(code, lino, _end);
     }
   }
@@ -513,7 +514,10 @@ int32_t doStreamEventEncodeOpState(void** buf, int32_t len, SOperatorInfo* pOper
   // 3.dataVersion
   tlen += taosEncodeFixedI32(buf, pInfo->dataVersion);
 
-  // 4.checksum
+  // 4.basicInfo
+  tlen += encodeStreamBasicInfo(buf, &pInfo->basic);
+
+  // 5.checksum
   if (buf) {
     uint32_t cksum = taosCalcChecksum(0, pData, len - sizeof(uint32_t));
     tlen += taosEncodeFixedU32(buf, cksum);
@@ -529,13 +533,14 @@ int32_t doStreamEventDecodeOpState(void* buf, int32_t len, SOperatorInfo* pOpera
   int32_t                      lino = 0;
   SStreamEventAggOperatorInfo* pInfo = pOperator->info;
   SExecTaskInfo*               pTaskInfo = pOperator->pTaskInfo;
+  void*                        pDataEnd = POINTER_SHIFT(buf, len);
   if (!pInfo) {
     code = TSDB_CODE_FAILED;
     QUERY_CHECK_CODE(code, lino, _end);
   }
   SStreamAggSupporter* pAggSup = &pInfo->streamAggSup;
 
-  // 4.checksum
+  // 5.checksum
   int32_t dataLen = len - sizeof(uint32_t);
   void*   pCksum = POINTER_SHIFT(buf, dataLen);
   if (taosCheckChecksum(buf, dataLen, *(uint32_t*)pCksum) != TSDB_CODE_SUCCESS) {
@@ -543,6 +548,7 @@ int32_t doStreamEventDecodeOpState(void* buf, int32_t len, SOperatorInfo* pOpera
     code = TSDB_CODE_FAILED;
     QUERY_CHECK_CODE(code, lino, _end);
   }
+  pDataEnd = pCksum;
 
   // 1.streamAggSup.pResultRows
   int32_t mapSize = 0;
@@ -566,6 +572,12 @@ int32_t doStreamEventDecodeOpState(void* buf, int32_t len, SOperatorInfo* pOpera
 
   // 3.dataVersion
   buf = taosDecodeFixedI64(buf, &pInfo->dataVersion);
+
+  // 4.basicInfo
+  if (buf < pDataEnd) {
+    code = decodeStreamBasicInfo(&buf, &pInfo->basic);
+    QUERY_CHECK_CODE(code, lino, _end);
+  }
 
 _end:
   if (code != TSDB_CODE_SUCCESS) {
@@ -610,18 +622,20 @@ static int32_t buildEventResult(SOperatorInfo* pOperator, SSDataBlock** ppRes) {
   if (pBInfo->pRes->info.rows > 0) {
     printDataBlock(pBInfo->pRes, getStreamOpName(pOperator->operatorType), GET_TASKID(pTaskInfo));
     if (BIT_FLAG_TEST_MASK(pTaskInfo->streamInfo.eventTypes, SNOTIFY_EVENT_WINDOW_CLOSE)) {
-      code = addAggResultNotifyEvent(pBInfo->pRes, pTaskInfo->streamInfo.notifyResultSchema, &pInfo->basic.windowEventSup);
+      code =
+          addAggResultNotifyEvent(pBInfo->pRes, pTaskInfo->streamInfo.notifyResultSchema, &pInfo->basic.notifyEventSup);
       QUERY_CHECK_CODE(code, lino, _end);
     }
     (*ppRes) = pBInfo->pRes;
     return code;
   }
 
-  code = buildNotifyEventBlock(pTaskInfo, &pInfo->basic.windowEventSup);
+  code = buildNotifyEventBlock(pTaskInfo, &pInfo->basic.notifyEventSup);
   QUERY_CHECK_CODE(code, lino, _end);
-  if (pInfo->basic.windowEventSup.pEventBlock->info.rows > 0) {
-    printDataBlock(pInfo->basic.windowEventSup.pEventBlock, getStreamOpName(pOperator->operatorType), GET_TASKID(pTaskInfo));
-    (*ppRes) = pInfo->basic.windowEventSup.pEventBlock;
+  if (pInfo->basic.notifyEventSup.pEventBlock->info.rows > 0) {
+    printDataBlock(pInfo->basic.notifyEventSup.pEventBlock, getStreamOpName(pOperator->operatorType),
+                   GET_TASKID(pTaskInfo));
+    (*ppRes) = pInfo->basic.notifyEventSup.pEventBlock;
     return code;
   }
 
@@ -1006,7 +1020,8 @@ int32_t createStreamEventAggOperatorInfo(SOperatorInfo* downstream, SPhysiNode* 
   pInfo->pPkDeleted = tSimpleHashInit(64, hashFn);
   QUERY_CHECK_NULL(pInfo->pPkDeleted, code, lino, _error, terrno);
   pInfo->destHasPrimaryKey = pEventNode->window.destHasPrimaryKey;
-  initStreamBasicInfo(&pInfo->basic);
+  code = initStreamBasicInfo(&pInfo->basic);
+  QUERY_CHECK_CODE(code, lino, _error);
 
   pInfo->pOperator = pOperator;
   setOperatorInfo(pOperator, "StreamEventAggOperator", QUERY_NODE_PHYSICAL_PLAN_STREAM_EVENT, true, OP_NOT_OPENED,

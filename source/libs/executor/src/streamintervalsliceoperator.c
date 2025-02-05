@@ -316,6 +316,20 @@ static int32_t doStreamIntervalSliceAggImpl(SOperatorInfo* pOperator, SSDataBloc
     code = setIntervalSliceOutputBuf(&curPoint, pSup->pCtx, numOfOutput, pSup->rowEntryInfoOffset);
     QUERY_CHECK_CODE(code, lino, _end);
 
+    if (IS_NORMAL_INTERVAL_OP(pOperator) &&
+        BIT_FLAG_TEST_MASK(pTaskInfo->streamInfo.eventTypes, SNOTIFY_EVENT_WINDOW_OPEN)) {
+      SSessionKey key = {.win = curWin, .groupId = groupId};
+      code = addIntervalAggNotifyEvent(SNOTIFY_EVENT_WINDOW_OPEN, &key, &pInfo->basic.notifyEventSup);
+      QUERY_CHECK_CODE(code, lino, _end);
+    }
+
+    if (IS_NORMAL_INTERVAL_OP(pOperator) &&
+        BIT_FLAG_TEST_MASK(pTaskInfo->streamInfo.eventTypes, SNOTIFY_EVENT_WINDOW_CLOSE)) {
+      SSessionKey key = {.win = curWin, .groupId = groupId};
+      code = addIntervalAggNotifyEvent(SNOTIFY_EVENT_WINDOW_CLOSE, &key, &pInfo->basic.notifyEventSup);
+      QUERY_CHECK_CODE(code, lino, _end);
+    }
+
     resetIntervalSliceFunctionKey(pSup->pCtx, numOfOutput);
     if (pInfo->hasInterpoFunc && IS_VALID_WIN_KEY(prevPoint.winKey.win.skey) && curPoint.winKey.win.skey != curTs) {
       doStreamSliceInterpolation(prevPoint.pLastRow, curPoint.winKey.win.skey, curTs, pBlock, startPos, &pOperator->exprSupp, INTERVAL_SLICE_START, pInfo->pOffsetInfo);
@@ -645,6 +659,8 @@ int32_t createStreamIntervalSliceOperatorInfo(SOperatorInfo* downstream, SPhysiN
   pInfo->pOperator = pOperator;
   pInfo->hasFill = false;
   pInfo->hasInterpoFunc = windowinterpNeeded(pExpSup->pCtx, numOfExprs);
+  code = initStreamBasicInfo(&pInfo->basic);
+  QUERY_CHECK_CODE(code, lino, _error);
 
   setOperatorInfo(pOperator, "StreamIntervalSliceOperator", QUERY_NODE_PHYSICAL_PLAN_STREAM_CONTINUE_INTERVAL, true, OP_NOT_OPENED,
                   pInfo, pTaskInfo);
@@ -652,8 +668,6 @@ int32_t createStreamIntervalSliceOperatorInfo(SOperatorInfo* downstream, SPhysiN
                                          optrDefaultBufFn, NULL, optrDefaultGetNextExtFn, NULL);
   setOperatorStreamStateFn(pOperator, streamIntervalSliceReleaseState, streamIntervalSliceReloadState);
 
-  code = initStreamBasicInfo(&pInfo->basic);
-  QUERY_CHECK_CODE(code, lino, _error);
   if (downstream) {
     code = initIntervalSliceDownStream(downstream, &pInfo->streamAggSup, pPhyNode->type, pInfo->primaryTsIndex,
                                        &pInfo->twAggSup, &pInfo->basic, &pInfo->interval, pInfo->hasInterpoFunc);
