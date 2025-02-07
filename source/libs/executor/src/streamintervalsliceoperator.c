@@ -87,21 +87,42 @@ static int32_t buildIntervalSliceResult(SOperatorInfo* pOperator, SSDataBlock** 
   SExecTaskInfo*                    pTaskInfo = pOperator->pTaskInfo;
   uint16_t                          opType = pOperator->operatorType;
   SStreamAggSupporter*              pAggSup = &pInfo->streamAggSup;
-
+  SStreamNotifyEventSupp*           pNotifySup = &pInfo->basic.notifyEventSup;
+  bool                              addNotifyEvent = false;
+  addNotifyEvent = IS_NORMAL_INTERVAL_OP(pOperator) &&
+                   BIT_FLAG_TEST_MASK(pTaskInfo->streamInfo.eventTypes, SNOTIFY_EVENT_WINDOW_CLOSE);
   doBuildDeleteResultImpl(&pInfo->streamAggSup.stateStore, pInfo->streamAggSup.pState, pInfo->pDelWins, &pInfo->delIndex,
                           pInfo->pDelRes);
   if (pInfo->pDelRes->info.rows != 0) {
     // process the rest of the data
     printDataBlock(pInfo->pDelRes, getStreamOpName(opType), GET_TASKID(pTaskInfo));
+    if (addNotifyEvent) {
+      code = addAggDeleteNotifyEvent(pInfo->pDelRes, pNotifySup);
+      QUERY_CHECK_CODE(code, lino, _end);
+    }
     (*ppRes) = pInfo->pDelRes;
     return code;
   }
 
-  doBuildStreamIntervalResult(pOperator, pInfo->streamAggSup.pState, pInfo->binfo.pRes, &pInfo->groupResInfo);
+  doBuildStreamIntervalResult(pOperator, pInfo->streamAggSup.pState, pInfo->binfo.pRes, &pInfo->groupResInfo,
+                              addNotifyEvent ? pNotifySup->pSessionKeys : NULL);
   if (pInfo->binfo.pRes->info.rows != 0) {
     printDataBlock(pInfo->binfo.pRes, getStreamOpName(opType), GET_TASKID(pTaskInfo));
+    if (addNotifyEvent) {
+      code = addAggResultNotifyEvent(pInfo->binfo.pRes, pNotifySup->pSessionKeys,
+                                     pTaskInfo->streamInfo.notifyResultSchema, pNotifySup);
+      QUERY_CHECK_CODE(code, lino, _end);
+    }
     (*ppRes) = pInfo->binfo.pRes;
     goto _end;
+  }
+
+  code = buildNotifyEventBlock(pTaskInfo, pNotifySup);
+  QUERY_CHECK_CODE(code, lino, _end);
+  if (pNotifySup->pEventBlock && pNotifySup->pEventBlock->info.rows > 0) {
+    printDataBlock(pNotifySup->pEventBlock, getStreamOpName(opType), GET_TASKID(pTaskInfo));
+    (*ppRes) = pNotifySup->pEventBlock;
+    return code;
   }
 
 _end:
@@ -316,17 +337,10 @@ static int32_t doStreamIntervalSliceAggImpl(SOperatorInfo* pOperator, SSDataBloc
     code = setIntervalSliceOutputBuf(&curPoint, pSup->pCtx, numOfOutput, pSup->rowEntryInfoOffset);
     QUERY_CHECK_CODE(code, lino, _end);
 
-    if (IS_NORMAL_INTERVAL_OP(pOperator) &&
+    if (winCode != TSDB_CODE_SUCCESS && IS_NORMAL_INTERVAL_OP(pOperator) &&
         BIT_FLAG_TEST_MASK(pTaskInfo->streamInfo.eventTypes, SNOTIFY_EVENT_WINDOW_OPEN)) {
       SSessionKey key = {.win = curWin, .groupId = groupId};
       code = addIntervalAggNotifyEvent(SNOTIFY_EVENT_WINDOW_OPEN, &key, &pInfo->basic.notifyEventSup);
-      QUERY_CHECK_CODE(code, lino, _end);
-    }
-
-    if (IS_NORMAL_INTERVAL_OP(pOperator) &&
-        BIT_FLAG_TEST_MASK(pTaskInfo->streamInfo.eventTypes, SNOTIFY_EVENT_WINDOW_CLOSE)) {
-      SSessionKey key = {.win = curWin, .groupId = groupId};
-      code = addIntervalAggNotifyEvent(SNOTIFY_EVENT_WINDOW_CLOSE, &key, &pInfo->basic.notifyEventSup);
       QUERY_CHECK_CODE(code, lino, _end);
     }
 
@@ -659,14 +673,15 @@ int32_t createStreamIntervalSliceOperatorInfo(SOperatorInfo* downstream, SPhysiN
   pInfo->pOperator = pOperator;
   pInfo->hasFill = false;
   pInfo->hasInterpoFunc = windowinterpNeeded(pExpSup->pCtx, numOfExprs);
-  code = initStreamBasicInfo(&pInfo->basic);
-  QUERY_CHECK_CODE(code, lino, _error);
 
   setOperatorInfo(pOperator, "StreamIntervalSliceOperator", QUERY_NODE_PHYSICAL_PLAN_STREAM_CONTINUE_INTERVAL, true, OP_NOT_OPENED,
                   pInfo, pTaskInfo);
   pOperator->fpSet = createOperatorFpSet(optrDummyOpenFn, doStreamIntervalSliceNext, NULL, destroyStreamIntervalSliceOperatorInfo,
                                          optrDefaultBufFn, NULL, optrDefaultGetNextExtFn, NULL);
   setOperatorStreamStateFn(pOperator, streamIntervalSliceReleaseState, streamIntervalSliceReloadState);
+
+  code = initStreamBasicInfo(&pInfo->basic, pOperator);
+  QUERY_CHECK_CODE(code, lino, _error);
 
   if (downstream) {
     code = initIntervalSliceDownStream(downstream, &pInfo->streamAggSup, pPhyNode->type, pInfo->primaryTsIndex,

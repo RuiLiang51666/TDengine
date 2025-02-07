@@ -41,6 +41,16 @@ extern "C" {
   ((op)->operatorType == QUERY_NODE_PHYSICAL_PLAN_STREAM_INTERVAL || \
    (op)->operatorType == QUERY_NODE_PHYSICAL_PLAN_STREAM_FINAL_INTERVAL)
 
+#define IS_NORMAL_SESSION_OP(op)                                    \
+  ((op)->operatorType == QUERY_NODE_PHYSICAL_PLAN_STREAM_SESSION || \
+   (op)->operatorType == QUERY_NODE_PHYSICAL_PLAN_STREAM_FINAL_SESSION)
+
+#define IS_NORMAL_STATE_OP(op) ((op)->operatorType == QUERY_NODE_PHYSICAL_PLAN_STREAM_STATE)
+
+#define IS_NORMAL_EVENT_OP(op) ((op)->operatorType == QUERY_NODE_PHYSICAL_PLAN_STREAM_EVENT)
+
+#define IS_NORMAL_COUNT_OP(op) ((op)->operatorType == QUERY_NODE_PHYSICAL_PLAN_STREAM_COUNT)
+
 #define IS_CONTINUE_INTERVAL_OP(op) ((op)->operatorType == QUERY_NODE_PHYSICAL_PLAN_STREAM_CONTINUE_INTERVAL)
 
 #define IS_FILL_CONST_VALUE(type) \
@@ -61,9 +71,9 @@ typedef struct SSlicePoint {
 void    setStreamOperatorState(SSteamOpBasicInfo* pBasicInfo, EStreamType type);
 bool    needSaveStreamOperatorInfo(SSteamOpBasicInfo* pBasicInfo);
 void    saveStreamOperatorStateComplete(SSteamOpBasicInfo* pBasicInfo);
-int32_t initStreamBasicInfo(SSteamOpBasicInfo* pBasicInfo);
+int32_t initStreamBasicInfo(SSteamOpBasicInfo* pBasicInfo, const struct SOperatorInfo* pOperator);
 void    destroyStreamBasicInfo(SSteamOpBasicInfo* pBasicInfo);
-int32_t encodeStreamBasicInfo(void** buf, SSteamOpBasicInfo* pBasicInfo);
+int32_t encodeStreamBasicInfo(void** buf, const SSteamOpBasicInfo* pBasicInfo);
 int32_t decodeStreamBasicInfo(void** buf, SSteamOpBasicInfo* pBasicInfo);
 
 int64_t getDeleteMarkFromOption(SStreamNodeOption* pOption);
@@ -101,7 +111,7 @@ SResultCellData* getSliceResultCell(SResultCellData* pRowVal, int32_t index, int
 int32_t          getDownstreamRes(struct SOperatorInfo* downstream, SSDataBlock** ppRes, SColumnInfo** ppPkCol);
 void             destroyFlusedppPos(void* ppRes);
 void             doBuildStreamIntervalResult(struct SOperatorInfo* pOperator, void* pState, SSDataBlock* pBlock,
-                                             SGroupResInfo* pGroupResInfo);
+                                             SGroupResInfo* pGroupResInfo, SArray* pSessionKeys);
 void             transBlockToSliceResultRow(const SSDataBlock* pBlock, int32_t rowId, TSKEY ts, SSliceRowData* pRowVal,
                                             int32_t rowSize, void* pPkData, SColumnInfoData* pPkCol, int32_t* pCellOffsetInfo);
 int32_t getQualifiedRowNumDesc(SExprSupp* pExprSup, SSDataBlock* pBlock, TSKEY* tsCols, int32_t rowId, bool ignoreNull);
@@ -125,8 +135,10 @@ int32_t addSessionAggNotifyEvent(EStreamNotifyEventType eventType, const SSessio
                                  SStreamNotifyEventSupp* sup);
 int32_t addCountAggNotifyEvent(EStreamNotifyEventType eventType, const SSessionKey* pSessionKey,
                                SStreamNotifyEventSupp* sup);
-int32_t addAggResultNotifyEvent(const SSDataBlock* pResultBlock, const SSchemaWrapper* pSchemaWrapper,
-                                SStreamNotifyEventSupp* sup);
+int32_t removeAggNotifyEvent(const SSessionKey* pSessionKey, SStreamNotifyEventSupp* sup);
+int32_t addAggResultNotifyEvent(const SSDataBlock* pResultBlock, const SArray* pSessionKeys,
+                                const SSchemaWrapper* pSchemaWrapper, SStreamNotifyEventSupp* sup);
+int32_t addAggDeleteNotifyEvent(const SSDataBlock* pDeleteBlock, SStreamNotifyEventSupp* sup);
 int32_t buildNotifyEventBlock(const SExecTaskInfo* pTaskInfo, SStreamNotifyEventSupp* sup);
 
 #ifdef __cplusplus

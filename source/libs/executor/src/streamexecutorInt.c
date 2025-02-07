@@ -16,6 +16,7 @@
 #include "streamexecutorInt.h"
 
 #include "executorInt.h"
+#include "operator.h"
 #include "tdatablock.h"
 
 #define NOTIFY_EVENT_NAME_CACHE_LIMIT_MB 16
@@ -23,9 +24,13 @@
 typedef struct SStreamNotifyEvent {
   uint64_t gid;
   TSKEY    skey;
-  bool     isEnd;
-  char*    content;
+  int32_t  eventType;
+  cJSON*   pJson;
 } SStreamNotifyEvent;
+
+#define NOTIFY_EVENT_KEY_SIZE                                                                       \
+  ((sizeof(((struct SStreamNotifyEvent*)0)->gid) + sizeof(((struct SStreamNotifyEvent*)0)->skey)) + \
+   sizeof(((struct SStreamNotifyEvent*)0)->eventType))
 
 void setStreamOperatorState(SSteamOpBasicInfo* pBasicInfo, EStreamType type) {
   if (type != STREAM_GET_ALL && type != STREAM_CHECKPOINT) {
@@ -38,22 +43,23 @@ bool needSaveStreamOperatorInfo(SSteamOpBasicInfo* pBasicInfo) { return pBasicIn
 void saveStreamOperatorStateComplete(SSteamOpBasicInfo* pBasicInfo) { pBasicInfo->updateOperatorInfo = false; }
 
 static void destroyStreamWindowEvent(void* ptr) {
-  SStreamNotifyEvent* pEvent = ptr;
-  if (pEvent == NULL || pEvent->content == NULL) return;
-  cJSON_free(pEvent->content);
+  SStreamNotifyEvent* pEvent = (SStreamNotifyEvent*)ptr;
+  if (pEvent && pEvent->pJson) {
+    cJSON_Delete(pEvent->pJson);
+    pEvent->pJson = NULL;
+  }
 }
 
 static void destroyStreamNotifyEventSupp(SStreamNotifyEventSupp* sup) {
   if (sup == NULL) return;
-  tdListFreeP(sup->pWindowEvents, destroyStreamWindowEvent);
   taosHashCleanup(sup->pWindowEventHashMap);
   taosHashCleanup(sup->pTableNameHashMap);
-  taosHashCleanup(sup->pResultHashMap);
   blockDataDestroy(sup->pEventBlock);
+  taosArrayDestroy(sup->pSessionKeys);
   *sup = (SStreamNotifyEventSupp){0};
 }
 
-static int32_t initStreamNotifyEventSupp(SStreamNotifyEventSupp* sup) {
+static int32_t initStreamNotifyEventSupp(SStreamNotifyEventSupp* sup, const char* windowType, int32_t resCapacity) {
   int32_t         code = TSDB_CODE_SUCCESS;
   int32_t         lino = 0;
   SSDataBlock*    pBlock = NULL;
@@ -74,17 +80,18 @@ static int32_t initStreamNotifyEventSupp(SStreamNotifyEventSupp* sup) {
   code = blockDataAppendColInfo(pBlock, &infoData);
   QUERY_CHECK_CODE(code, lino, _end);
 
-  sup->pWindowEvents = tdListNew(sizeof(SStreamNotifyEvent));
-  QUERY_CHECK_NULL(sup->pWindowEvents, code, lino, _end, terrno);
-  sup->pWindowEventHashMap = taosHashInit(4096, taosGetDefaultHashFunction(TSDB_DATA_TYPE_BINARY), false, HASH_NO_LOCK);
+  sup->pWindowEventHashMap = taosHashInit(4096, taosGetDefaultHashFunction(TSDB_DATA_TYPE_BINARY), true, HASH_NO_LOCK);
   QUERY_CHECK_NULL(sup->pWindowEventHashMap, code, lino, _end, terrno);
+  taosHashSetFreeFp(sup->pWindowEventHashMap, destroyStreamWindowEvent);
   sup->pTableNameHashMap = taosHashInit(1024, taosGetDefaultHashFunction(TSDB_DATA_TYPE_UBIGINT), false, HASH_NO_LOCK);
   QUERY_CHECK_NULL(sup->pTableNameHashMap, code, lino, _end, terrno);
-  sup->pResultHashMap = taosHashInit(4096, taosGetDefaultHashFunction(TSDB_DATA_TYPE_BINARY), false, HASH_NO_LOCK);
-  QUERY_CHECK_NULL(sup->pResultHashMap, code, lino, _end, terrno);
-  taosHashSetFreeFp(sup->pResultHashMap, destroyStreamWindowEvent);
   sup->pEventBlock = pBlock;
   pBlock = NULL;
+  code = blockDataEnsureCapacity(sup->pEventBlock, resCapacity);
+  QUERY_CHECK_CODE(code, lino, _end);
+  sup->windowType = windowType;
+  sup->pSessionKeys = taosArrayInit(resCapacity, sizeof(SSessionKey));
+  QUERY_CHECK_NULL(sup->pSessionKeys, code, lino, _end, terrno);
 
 _end:
   if (code != TSDB_CODE_SUCCESS) {
@@ -99,33 +106,51 @@ _end:
   return code;
 }
 
-int32_t initStreamBasicInfo(SSteamOpBasicInfo* pBasicInfo) {
+int32_t initStreamBasicInfo(SSteamOpBasicInfo* pBasicInfo, const struct SOperatorInfo* pOperator) {
   pBasicInfo->primaryPkIndex = -1;
   pBasicInfo->updateOperatorInfo = false;
-  return initStreamNotifyEventSupp(&pBasicInfo->notifyEventSup);
+  const char* windowType = NULL;
+  if (IS_NORMAL_INTERVAL_OP(pOperator)) {
+    windowType = "Time";
+  } else if (IS_NORMAL_SESSION_OP(pOperator)) {
+    windowType = "Session";
+  } else if (IS_NORMAL_STATE_OP(pOperator)) {
+    windowType = "State";
+  } else if (IS_NORMAL_EVENT_OP(pOperator)) {
+    windowType = "Event";
+  } else if (IS_NORMAL_COUNT_OP(pOperator)) {
+    windowType = "Count";
+  } else {
+    return TSDB_CODE_SUCCESS;
+  }
+  return initStreamNotifyEventSupp(&pBasicInfo->notifyEventSup, windowType, pOperator->resultInfo.capacity);
 }
 
 void destroyStreamBasicInfo(SSteamOpBasicInfo* pBasicInfo) {
   destroyStreamNotifyEventSupp(&pBasicInfo->notifyEventSup);
 }
 
-static int32_t encodeStreamNotifyEventSupp(void** buf, SStreamNotifyEventSupp* sup) {
-  int32_t    tlen = 0;
-  SListIter  iter = {0};
-  SListNode* pNode = NULL;
+static int32_t encodeStreamNotifyEventSupp(void** buf, const SStreamNotifyEventSupp* sup) {
+  int32_t tlen = 0;
+  void*   pIter = NULL;
+  char*   str = NULL;
 
-  if (sup->pWindowEvents == NULL) {
+  if (sup == NULL) {
     return tlen;
   }
 
-  tlen += taosEncodeFixedI32(buf, listNEles(sup->pWindowEvents));
-  tdListInitIter(sup->pWindowEvents, &iter, TD_LIST_FORWARD);
-  while ((pNode = tdListNext(&iter)) != NULL) {
-    SStreamNotifyEvent* pEvent = (SStreamNotifyEvent*)pNode->data;
+  tlen += taosEncodeFixedI32(buf, taosHashGetSize(sup->pWindowEventHashMap));
+  pIter = taosHashIterate(sup->pWindowEventHashMap, NULL);
+  while (pIter) {
+    const SStreamNotifyEvent* pEvent = (const SStreamNotifyEvent*)pIter;
+    str = cJSON_PrintUnformatted(pEvent->pJson);
+
     tlen += taosEncodeFixedU64(buf, pEvent->gid);
     tlen += taosEncodeFixedI64(buf, pEvent->skey);
-    tlen += taosEncodeFixedBool(buf, pEvent->isEnd);
-    tlen += taosEncodeString(buf, pEvent->content);
+    tlen += taosEncodeFixedI32(buf, pEvent->eventType);
+    tlen += taosEncodeString(buf, str);
+    cJSON_free(str);
+    pIter = taosHashIterate(sup->pWindowEventHashMap, pIter);
   }
   return tlen;
 }
@@ -133,43 +158,37 @@ static int32_t encodeStreamNotifyEventSupp(void** buf, SStreamNotifyEventSupp* s
 static int32_t decodeStreamNotifyEventSupp(void** buf, SStreamNotifyEventSupp* sup) {
   int32_t            code = TSDB_CODE_SUCCESS;
   int32_t            lino = 0;
-  int32_t            size = 0;
   void*              p = *buf;
+  int32_t            size = 0;
+  uint64_t           len = 0;
   SStreamNotifyEvent item = {0};
-  SListNode*         pNode = NULL;
 
   p = taosDecodeFixedI32(p, &size);
   for (int32_t i = 0; i < size; i++) {
-    SStreamNotifyEvent item = {0};
     p = taosDecodeFixedU64(p, &item.gid);
     p = taosDecodeFixedI64(p, &item.skey);
-    p = taosDecodeFixedBool(p, &item.isEnd);
-    p = taosDecodeString(p, &item.content);
-    // Append to event list and hash map
-    code = tdListAppend(sup->pWindowEvents, &item);
+    p = taosDecodeFixedI32(p, &item.eventType);
+    p = taosDecodeVariantU64(p, &len);
+    item.pJson = cJSON_Parse(p);
+    if (item.pJson == NULL) {
+      qWarn("failed to parse the json content since %s", cJSON_GetErrorPtr());
+    }
+    QUERY_CHECK_NULL(item.pJson, code, lino, _end, TSDB_CODE_INTERNAL_ERROR);
+    p += len;
+    code = taosHashPut(sup->pWindowEventHashMap, &item, NOTIFY_EVENT_KEY_SIZE, &item, sizeof(SStreamNotifyEvent));
     QUERY_CHECK_CODE(code, lino, _end);
-    pNode = tdListGetTail(sup->pWindowEvents);
-    QUERY_CHECK_NULL(pNode, code, lino, _end, TSDB_CODE_INTERNAL_ERROR);
-    code = taosHashPut(sup->pWindowEventHashMap, &item, sizeof(item.gid) + sizeof(item.skey) + sizeof(item.isEnd),
-                       &pNode, POINTER_BYTES);
-    QUERY_CHECK_CODE(code, lino, _end);
-    pNode = NULL;
-    item.content = NULL;
+    item.pJson = NULL;
   }
   *buf = p;
 _end:
   if (code != TSDB_CODE_SUCCESS) {
     qError("%s failed at line %d since %s", __func__, lino, tstrerror(code));
   }
-  if (pNode != NULL) {
-    pNode = tdListPopNode(sup->pWindowEvents, pNode);
-    taosMemoryFreeClear(pNode);
-  }
   destroyStreamWindowEvent(&item);
   return code;
 }
 
-int32_t encodeStreamBasicInfo(void** buf, SSteamOpBasicInfo* pBasicInfo) {
+int32_t encodeStreamBasicInfo(void** buf, const SSteamOpBasicInfo* pBasicInfo) {
   return encodeStreamNotifyEventSupp(buf, &pBasicInfo->notifyEventSup);
 }
 
@@ -206,44 +225,44 @@ static int32_t jsonAddColumnField(const char* colName, int16_t type, bool isNull
 
   switch (type) {
     case TSDB_DATA_TYPE_BOOL: {
-      bool val = *(bool*)pData;
+      bool val = *(const bool*)pData;
       JSON_CHECK_ADD_ITEM(obj, colName, cJSON_CreateBool(val));
       break;
     }
 
     case TSDB_DATA_TYPE_TINYINT: {
-      int8_t val = *(int8_t*)pData;
+      int8_t val = *(const int8_t*)pData;
       JSON_CHECK_ADD_ITEM(obj, colName, cJSON_CreateNumber(val));
       break;
     }
 
     case TSDB_DATA_TYPE_SMALLINT: {
-      int16_t val = *(int16_t*)pData;
+      int16_t val = *(const int16_t*)pData;
       JSON_CHECK_ADD_ITEM(obj, colName, cJSON_CreateNumber(val));
       break;
     }
 
     case TSDB_DATA_TYPE_INT: {
-      int32_t val = *(int32_t*)pData;
+      int32_t val = *(const int32_t*)pData;
       JSON_CHECK_ADD_ITEM(obj, colName, cJSON_CreateNumber(val));
       break;
     }
 
     case TSDB_DATA_TYPE_BIGINT:
     case TSDB_DATA_TYPE_TIMESTAMP: {
-      int64_t val = *(int64_t*)pData;
+      int64_t val = *(const int64_t*)pData;
       JSON_CHECK_ADD_ITEM(obj, colName, cJSON_CreateNumber(val));
       break;
     }
 
     case TSDB_DATA_TYPE_FLOAT: {
-      float val = *(float*)pData;
+      float val = *(const float*)pData;
       JSON_CHECK_ADD_ITEM(obj, colName, cJSON_CreateNumber(val));
       break;
     }
 
     case TSDB_DATA_TYPE_DOUBLE: {
-      double val = *(double*)pData;
+      double val = *(const double*)pData;
       JSON_CHECK_ADD_ITEM(obj, colName, cJSON_CreateNumber(val));
       break;
     }
@@ -269,25 +288,25 @@ static int32_t jsonAddColumnField(const char* colName, int16_t type, bool isNull
     }
 
     case TSDB_DATA_TYPE_UTINYINT: {
-      uint8_t val = *(uint8_t*)pData;
+      uint8_t val = *(const uint8_t*)pData;
       JSON_CHECK_ADD_ITEM(obj, colName, cJSON_CreateNumber(val));
       break;
     }
 
     case TSDB_DATA_TYPE_USMALLINT: {
-      uint16_t val = *(uint16_t*)pData;
+      uint16_t val = *(const uint16_t*)pData;
       JSON_CHECK_ADD_ITEM(obj, colName, cJSON_CreateNumber(val));
       break;
     }
 
     case TSDB_DATA_TYPE_UINT: {
-      uint32_t val = *(uint32_t*)pData;
+      uint32_t val = *(const uint32_t*)pData;
       JSON_CHECK_ADD_ITEM(obj, colName, cJSON_CreateNumber(val));
       break;
     }
 
     case TSDB_DATA_TYPE_UBIGINT: {
-      uint64_t val = *(uint64_t*)pData;
+      uint64_t val = *(const uint64_t*)pData;
       JSON_CHECK_ADD_ITEM(obj, colName, cJSON_CreateNumber(val));
       break;
     }
@@ -308,53 +327,80 @@ _end:
   return code;
 }
 
-int32_t addEventAggNotifyEvent(EStreamNotifyEventType eventType, const SSessionKey* pSessionKey,
-                               const SSDataBlock* pInputBlock, const SNodeList* pCondCols, int32_t ri,
-                               SStreamNotifyEventSupp* sup) {
-  int32_t            code = TSDB_CODE_SUCCESS;
-  int32_t            lino = 0;
-  SNode*             node = NULL;
-  cJSON*             event = NULL;
-  cJSON*             fields = NULL;
-  cJSON*             cond = NULL;
-  SStreamNotifyEvent item = {0};
-  SListNode*         pNode = NULL;
-  char               windowId[32];
+static cJSON* createBasicAggNotifyEvent(const char* windowType, EStreamNotifyEventType eventType,
+                                        const SSessionKey* pSessionKey) {
+  int32_t     code = TSDB_CODE_SUCCESS;
+  int32_t     lino = 0;
+  const char* eventTypeStr = NULL;
+  cJSON*      event = NULL;
+  char        windowId[32];
 
+  QUERY_CHECK_NULL(windowType, code, lino, _end, TSDB_CODE_INVALID_PARA);
   QUERY_CHECK_NULL(pSessionKey, code, lino, _end, TSDB_CODE_INVALID_PARA);
-  QUERY_CHECK_NULL(pInputBlock, code, lino, _end, TSDB_CODE_INVALID_PARA);
-  QUERY_CHECK_NULL(pInputBlock->pDataBlock, code, lino, _end, TSDB_CODE_INVALID_PARA);
-  QUERY_CHECK_NULL(pCondCols, code, lino, _end, TSDB_CODE_INVALID_PARA);
-  QUERY_CHECK_NULL(sup, code, lino, _end, TSDB_CODE_INVALID_PARA);
 
-  qDebug("add stream notify event from Event Window, type: %s, start: %" PRId64 ", end: %" PRId64,
-         (eventType == SNOTIFY_EVENT_WINDOW_OPEN) ? "WINDOW_OPEN" : "WINDOW_CLOSE", pSessionKey->win.skey,
-         pSessionKey->win.ekey);
+  if (eventType == SNOTIFY_EVENT_WINDOW_OPEN) {
+    eventTypeStr = "WINDOW_OPEN";
+  } else if (eventType == SNOTIFY_EVENT_WINDOW_CLOSE) {
+    eventTypeStr = "WINDOW_CLOSE";
+  } else if (eventType == SNOTIFY_EVENT_WINDOW_INVALIDATION) {
+    eventTypeStr = "WINDOW_INVALIDATION";
+  } else {
+    QUERY_CHECK_CONDITION(false, code, lino, _end, TSDB_CODE_INVALID_PARA);
+  }
+
+  qDebug("add stream notify event from %s Window, type: %s, start: %" PRId64 ", end: %" PRId64, windowType,
+         eventTypeStr, pSessionKey->win.skey, pSessionKey->win.ekey);
 
   event = cJSON_CreateObject();
   QUERY_CHECK_NULL(event, code, lino, _end, TSDB_CODE_OUT_OF_MEMORY);
 
   // add basic info
   streamNotifyGetEventWindowId(pSessionKey, windowId);
-  if (eventType == SNOTIFY_EVENT_WINDOW_OPEN) {
-    JSON_CHECK_ADD_ITEM(event, "eventType", cJSON_CreateStringReference("WINDOW_OPEN"));
-  } else if (eventType == SNOTIFY_EVENT_WINDOW_CLOSE) {
-    JSON_CHECK_ADD_ITEM(event, "eventType", cJSON_CreateStringReference("WINDOW_CLOSE"));
-  }
+  JSON_CHECK_ADD_ITEM(event, "eventType", cJSON_CreateStringReference(eventTypeStr));
   JSON_CHECK_ADD_ITEM(event, "eventTime", cJSON_CreateNumber(taosGetTimestampMs()));
-  JSON_CHECK_ADD_ITEM(event, "windowId", cJSON_CreateStringReference(windowId));
+  JSON_CHECK_ADD_ITEM(event, "windowId", cJSON_CreateString(windowId));
   JSON_CHECK_ADD_ITEM(event, "windowType", cJSON_CreateStringReference("Event"));
   JSON_CHECK_ADD_ITEM(event, "windowStart", cJSON_CreateNumber(pSessionKey->win.skey));
-  if (eventType == SNOTIFY_EVENT_WINDOW_CLOSE) {
+  if (eventType != SNOTIFY_EVENT_WINDOW_OPEN) {
     JSON_CHECK_ADD_ITEM(event, "windowEnd", cJSON_CreateNumber(pSessionKey->win.ekey));
   }
+
+_end:
+  if (code != TSDB_CODE_SUCCESS) {
+    qError("%s failed at line %d since %s", __func__, lino, tstrerror(code));
+    terrno = code;
+    cJSON_Delete(event);
+    event = NULL;
+  }
+  return event;
+}
+
+int32_t addEventAggNotifyEvent(EStreamNotifyEventType eventType, const SSessionKey* pSessionKey,
+                               const SSDataBlock* pInputBlock, const SNodeList* pCondCols, int32_t ri,
+                               SStreamNotifyEventSupp* sup) {
+  int32_t            code = TSDB_CODE_SUCCESS;
+  int32_t            lino = 0;
+  cJSON*             event = NULL;
+  cJSON*             fields = NULL;
+  cJSON*             cond = NULL;
+  const SNode*       pNode = NULL;
+  SStreamNotifyEvent item = {0};
+
+  QUERY_CHECK_NULL(pInputBlock, code, lino, _end, TSDB_CODE_INVALID_PARA);
+  QUERY_CHECK_NULL(pInputBlock->pDataBlock, code, lino, _end, TSDB_CODE_INVALID_PARA);
+  QUERY_CHECK_NULL(pCondCols, code, lino, _end, TSDB_CODE_INVALID_PARA);
+  QUERY_CHECK_NULL(sup, code, lino, _end, TSDB_CODE_INVALID_PARA);
+  QUERY_CHECK_NULL(sup->windowType, code, lino, _end, TSDB_CODE_INVALID_PARA);
+
+  event = createBasicAggNotifyEvent(sup->windowType, eventType, pSessionKey);
+  QUERY_CHECK_NULL(event, code, lino, _end, terrno);
 
   // create fields object to store matched column values
   fields = cJSON_CreateObject();
   QUERY_CHECK_NULL(fields, code, lino, _end, TSDB_CODE_OUT_OF_MEMORY);
-  FOREACH(node, pCondCols) {
-    SColumnNode*     pColDef = (SColumnNode*)node;
-    SColumnInfoData* pColData = taosArrayGet(pInputBlock->pDataBlock, pColDef->slotId);
+  FOREACH(pNode, pCondCols) {
+    const SColumnNode*     pColDef = (const SColumnNode*)pNode;
+    const SColumnInfoData* pColData = taosArrayGet(pInputBlock->pDataBlock, pColDef->slotId);
     code = jsonAddColumnField(pColDef->colName, pColData->info.type, colDataIsNull_s(pColData, ri),
                               colDataGetData(pColData, ri), fields);
     QUERY_CHECK_CODE(code, lino, _end);
@@ -369,30 +415,18 @@ int32_t addEventAggNotifyEvent(EStreamNotifyEventType eventType, const SSessionK
   JSON_CHECK_ADD_ITEM(event, "triggerConditions", cond);
   cond = NULL;
 
-  // convert json object to string value
   item.gid = pSessionKey->groupId;
   item.skey = pSessionKey->win.skey;
-  item.isEnd = (eventType == SNOTIFY_EVENT_WINDOW_CLOSE);
-  item.content = cJSON_PrintUnformatted(event);
-
-  // Append to event list and add to the hash map.
-  code = tdListAppend(sup->pWindowEvents, &item);
+  item.eventType = eventType;
+  item.pJson = event;
+  event = NULL;
+  code = taosHashPut(sup->pWindowEventHashMap, &item, NOTIFY_EVENT_KEY_SIZE, &item, sizeof(SStreamNotifyEvent));
   QUERY_CHECK_CODE(code, lino, _end);
-  pNode = tdListGetTail(sup->pWindowEvents);
-  QUERY_CHECK_NULL(pNode, code, lino, _end, TSDB_CODE_INTERNAL_ERROR);
-  code = taosHashPut(sup->pWindowEventHashMap, &item, sizeof(item.gid) + sizeof(item.skey) + sizeof(item.isEnd), &pNode,
-                     POINTER_BYTES);
-  QUERY_CHECK_CODE(code, lino, _end);
-  pNode = NULL;
-  item.content = NULL;
+  item.pJson = NULL;
 
 _end:
   if (code != TSDB_CODE_SUCCESS) {
     qError("%s failed at line %d since %s", __func__, lino, tstrerror(code));
-  }
-  if (pNode != NULL) {
-    pNode = tdListPopNode(sup->pWindowEvents, pNode);
-    taosMemoryFreeClear(pNode);
   }
   destroyStreamWindowEvent(&item);
   if (cond != NULL) {
@@ -414,34 +448,13 @@ int32_t addStateAggNotifyEvent(EStreamNotifyEventType eventType, const SSessionK
   int32_t            lino = 0;
   cJSON*             event = NULL;
   SStreamNotifyEvent item = {0};
-  SListNode*         pNode = NULL;
-  char               windowId[32];
 
-  QUERY_CHECK_NULL(pSessionKey, code, lino, _end, TSDB_CODE_INVALID_PARA);
   QUERY_CHECK_NULL(pCurState, code, lino, _end, TSDB_CODE_INVALID_PARA);
   QUERY_CHECK_NULL(sup, code, lino, _end, TSDB_CODE_INVALID_PARA);
+  QUERY_CHECK_NULL(sup->windowType, code, lino, _end, TSDB_CODE_INVALID_PARA);
 
-  qDebug("add stream notify event from State Window, type: %s, start: %" PRId64 ", end: %" PRId64,
-         (eventType == SNOTIFY_EVENT_WINDOW_OPEN) ? "WINDOW_OPEN" : "WINDOW_CLOSE", pSessionKey->win.skey,
-         pSessionKey->win.ekey);
-
-  event = cJSON_CreateObject();
-  QUERY_CHECK_NULL(event, code, lino, _end, TSDB_CODE_OUT_OF_MEMORY);
-
-  // add basic info
-  streamNotifyGetEventWindowId(pSessionKey, windowId);
-  if (eventType == SNOTIFY_EVENT_WINDOW_OPEN) {
-    JSON_CHECK_ADD_ITEM(event, "eventType", cJSON_CreateStringReference("WINDOW_OPEN"));
-  } else if (eventType == SNOTIFY_EVENT_WINDOW_CLOSE) {
-    JSON_CHECK_ADD_ITEM(event, "eventType", cJSON_CreateStringReference("WINDOW_CLOSE"));
-  }
-  JSON_CHECK_ADD_ITEM(event, "eventTime", cJSON_CreateNumber(taosGetTimestampMs()));
-  JSON_CHECK_ADD_ITEM(event, "windowId", cJSON_CreateStringReference(windowId));
-  JSON_CHECK_ADD_ITEM(event, "windowType", cJSON_CreateStringReference("State"));
-  JSON_CHECK_ADD_ITEM(event, "windowStart", cJSON_CreateNumber(pSessionKey->win.skey));
-  if (eventType == SNOTIFY_EVENT_WINDOW_CLOSE) {
-    JSON_CHECK_ADD_ITEM(event, "windowEnd", cJSON_CreateNumber(pSessionKey->win.ekey));
-  }
+  event = createBasicAggNotifyEvent(sup->windowType, eventType, pSessionKey);
+  QUERY_CHECK_NULL(event, code, lino, _end, terrno);
 
   // add state value
   if (eventType == SNOTIFY_EVENT_WINDOW_OPEN) {
@@ -456,7 +469,6 @@ int32_t addStateAggNotifyEvent(EStreamNotifyEventType eventType, const SSessionK
   code = jsonAddColumnField("curState", pCurState->type, pCurState->isNull, pCurState->pData, event);
   QUERY_CHECK_CODE(code, lino, _end);
   if (eventType == SNOTIFY_EVENT_WINDOW_CLOSE) {
-    // todo(kjq): pAnotherState should not be null
     if (pAnotherState) {
       code = jsonAddColumnField("nextState", pAnotherState->type, pAnotherState->isNull, pAnotherState->pData, event);
       QUERY_CHECK_CODE(code, lino, _end);
@@ -466,30 +478,18 @@ int32_t addStateAggNotifyEvent(EStreamNotifyEventType eventType, const SSessionK
     }
   }
 
-  // convert json object to string value
   item.gid = pSessionKey->groupId;
   item.skey = pSessionKey->win.skey;
-  item.isEnd = (eventType == SNOTIFY_EVENT_WINDOW_CLOSE);
-  item.content = cJSON_PrintUnformatted(event);
-
-  // Append to event list and add to the hash map.
-  code = tdListAppend(sup->pWindowEvents, &item);
+  item.eventType = eventType;
+  item.pJson = event;
+  event = NULL;
+  code = taosHashPut(sup->pWindowEventHashMap, &item, NOTIFY_EVENT_KEY_SIZE, &item, sizeof(SStreamNotifyEvent));
   QUERY_CHECK_CODE(code, lino, _end);
-  pNode = tdListGetTail(sup->pWindowEvents);
-  QUERY_CHECK_NULL(pNode, code, lino, _end, TSDB_CODE_INTERNAL_ERROR);
-  code = taosHashPut(sup->pWindowEventHashMap, &item, sizeof(item.gid) + sizeof(item.skey) + sizeof(item.isEnd), &pNode,
-                     POINTER_BYTES);
-  QUERY_CHECK_CODE(code, lino, _end);
-  pNode = NULL;
-  item.content = NULL;
+  item.pJson = NULL;
 
 _end:
   if (code != TSDB_CODE_SUCCESS) {
     qError("%s failed at line %d since %s", __func__, lino, tstrerror(code));
-  }
-  if (pNode != NULL) {
-    pNode = tdListPopNode(sup->pWindowEvents, pNode);
-    taosMemoryFreeClear(pNode);
   }
   destroyStreamWindowEvent(&item);
   if (event != NULL) {
@@ -498,64 +498,32 @@ _end:
   return code;
 }
 
-static int32_t addNormalAggNotifyEvent(const char* windowType, EStreamNotifyEventType eventType,
-                                       const SSessionKey* pSessionKey, SStreamNotifyEventSupp* sup) {
+static int32_t addNormalAggNotifyEvent(EStreamNotifyEventType eventType, const SSessionKey* pSessionKey,
+                                       SStreamNotifyEventSupp* sup) {
   int32_t            code = TSDB_CODE_SUCCESS;
   int32_t            lino = 0;
   cJSON*             event = NULL;
   SStreamNotifyEvent item = {0};
-  SListNode*         pNode = NULL;
-  char               windowId[32];
 
   QUERY_CHECK_NULL(pSessionKey, code, lino, _end, TSDB_CODE_INVALID_PARA);
   QUERY_CHECK_NULL(sup, code, lino, _end, TSDB_CODE_INVALID_PARA);
+  QUERY_CHECK_NULL(sup->windowType, code, lino, _end, TSDB_CODE_INVALID_PARA);
 
-  qDebug("add stream notify event from %s Window, type: %s, start: %" PRId64 ", end: %" PRId64, windowType,
-         (eventType == SNOTIFY_EVENT_WINDOW_OPEN) ? "WINDOW_OPEN" : "WINDOW_CLOSE", pSessionKey->win.skey,
-         pSessionKey->win.ekey);
+  event = createBasicAggNotifyEvent(sup->windowType, eventType, pSessionKey);
+  QUERY_CHECK_NULL(event, code, lino, _end, terrno);
 
-  event = cJSON_CreateObject();
-  QUERY_CHECK_NULL(event, code, lino, _end, TSDB_CODE_OUT_OF_MEMORY);
-
-  // add basic info
-  streamNotifyGetEventWindowId(pSessionKey, windowId);
-  if (eventType == SNOTIFY_EVENT_WINDOW_OPEN) {
-    JSON_CHECK_ADD_ITEM(event, "eventType", cJSON_CreateStringReference("WINDOW_OPEN"));
-  } else if (eventType == SNOTIFY_EVENT_WINDOW_CLOSE) {
-    JSON_CHECK_ADD_ITEM(event, "eventType", cJSON_CreateStringReference("WINDOW_CLOSE"));
-  }
-  JSON_CHECK_ADD_ITEM(event, "eventTime", cJSON_CreateNumber(taosGetTimestampMs()));
-  JSON_CHECK_ADD_ITEM(event, "windowId", cJSON_CreateStringReference(windowId));
-  JSON_CHECK_ADD_ITEM(event, "windowType", cJSON_CreateStringReference(windowType));
-  JSON_CHECK_ADD_ITEM(event, "windowStart", cJSON_CreateNumber(pSessionKey->win.skey));
-  if (eventType == SNOTIFY_EVENT_WINDOW_CLOSE) {
-    JSON_CHECK_ADD_ITEM(event, "windowEnd", cJSON_CreateNumber(pSessionKey->win.ekey));
-  }
-
-  // convert json object to string value
   item.gid = pSessionKey->groupId;
   item.skey = pSessionKey->win.skey;
-  item.isEnd = (eventType == SNOTIFY_EVENT_WINDOW_CLOSE);
-  item.content = cJSON_PrintUnformatted(event);
-
-  // Append to event list and add to the hash map.
-  code = tdListAppend(sup->pWindowEvents, &item);
+  item.eventType = eventType;
+  item.pJson = event;
+  event = NULL;
+  code = taosHashPut(sup->pWindowEventHashMap, &item, NOTIFY_EVENT_KEY_SIZE, &item, sizeof(SStreamNotifyEvent));
   QUERY_CHECK_CODE(code, lino, _end);
-  pNode = tdListGetTail(sup->pWindowEvents);
-  QUERY_CHECK_NULL(pNode, code, lino, _end, TSDB_CODE_INTERNAL_ERROR);
-  code = taosHashPut(sup->pWindowEventHashMap, &item, sizeof(item.gid) + sizeof(item.skey) + sizeof(item.isEnd), &pNode,
-                     POINTER_BYTES);
-  QUERY_CHECK_CODE(code, lino, _end);
-  pNode = NULL;
-  item.content = NULL;
+  item.pJson = NULL;
 
 _end:
   if (code != TSDB_CODE_SUCCESS) {
     qError("%s failed at line %d since %s", __func__, lino, tstrerror(code));
-  }
-  if (pNode != NULL) {
-    pNode = tdListPopNode(sup->pWindowEvents, pNode);
-    taosMemoryFreeClear(pNode);
   }
   destroyStreamWindowEvent(&item);
   if (event != NULL) {
@@ -566,62 +534,88 @@ _end:
 
 int32_t addIntervalAggNotifyEvent(EStreamNotifyEventType eventType, const SSessionKey* pSessionKey,
                                   SStreamNotifyEventSupp* sup) {
-  return addNormalAggNotifyEvent("Time", eventType, pSessionKey, sup);
+  return addNormalAggNotifyEvent(eventType, pSessionKey, sup);
 }
 
 int32_t addSessionAggNotifyEvent(EStreamNotifyEventType eventType, const SSessionKey* pSessionKey,
                                  SStreamNotifyEventSupp* sup) {
-  return addNormalAggNotifyEvent("Session", eventType, pSessionKey, sup);
+  return addNormalAggNotifyEvent(eventType, pSessionKey, sup);
 }
 
 int32_t addCountAggNotifyEvent(EStreamNotifyEventType eventType, const SSessionKey* pSessionKey,
                                SStreamNotifyEventSupp* sup) {
-  return addNormalAggNotifyEvent("Count", eventType, pSessionKey, sup);
+  return addNormalAggNotifyEvent(eventType, pSessionKey, sup);
 }
 
-int32_t addAggResultNotifyEvent(const SSDataBlock* pResultBlock, const SSchemaWrapper* pSchemaWrapper,
-                                SStreamNotifyEventSupp* sup) {
+int32_t removeAggNotifyEvent(const SSessionKey* pSessionKey, SStreamNotifyEventSupp* sup) {
   int32_t            code = TSDB_CODE_SUCCESS;
   int32_t            lino = 0;
-  SNode*             node = NULL;
-  cJSON*             event = NULL;
+  SStreamNotifyEvent item = {0};
+
+  QUERY_CHECK_NULL(pSessionKey, code, lino, _end, TSDB_CODE_INVALID_PARA);
+
+  if (sup == NULL || taosHashGetSize(sup->pWindowEventHashMap) == 0) {
+    goto _end;
+  }
+
+  item.gid = pSessionKey->groupId;
+  item.skey = pSessionKey->win.skey;
+  item.eventType = SNOTIFY_EVENT_WINDOW_CLOSE;
+  code = taosHashRemove(sup->pWindowEventHashMap, &item, NOTIFY_EVENT_KEY_SIZE);
+  if (code == TSDB_CODE_NOT_FOUND) {
+    code = TSDB_CODE_SUCCESS;
+  }
+  QUERY_CHECK_CODE(code, lino, _end);
+
+_end:
+  if (code != TSDB_CODE_SUCCESS) {
+    qError("%s failed at line %d since %s", __func__, lino, tstrerror(code));
+  }
+  return code;
+}
+
+int32_t addAggResultNotifyEvent(const SSDataBlock* pResultBlock, const SArray* pSessionKeys,
+                                const SSchemaWrapper* pSchemaWrapper, SStreamNotifyEventSupp* sup) {
+  int32_t            code = TSDB_CODE_SUCCESS;
+  int32_t            lino = 0;
   cJSON*             result = NULL;
   SStreamNotifyEvent item = {0};
-  SColumnInfoData*   pWstartCol = NULL;
 
   QUERY_CHECK_NULL(pResultBlock, code, lino, _end, TSDB_CODE_INVALID_PARA);
+  QUERY_CHECK_NULL(pSessionKeys, code, lino, _end, TSDB_CODE_INVALID_PARA);
   QUERY_CHECK_NULL(pSchemaWrapper, code, lino, _end, TSDB_CODE_INVALID_PARA);
   QUERY_CHECK_NULL(sup, code, lino, _end, TSDB_CODE_INVALID_PARA);
 
   qDebug("add %" PRId64 " stream notify results from window agg", pResultBlock->info.rows);
 
-  pWstartCol = taosArrayGet(pResultBlock->pDataBlock, 0);
   for (int32_t i = 0; i < pResultBlock->info.rows; ++i) {
-    event = cJSON_CreateObject();
-    QUERY_CHECK_NULL(event, code, lino, _end, TSDB_CODE_OUT_OF_MEMORY);
+    const SSessionKey* pSessionKey = taosArrayGet(pSessionKeys, i);
+    item.gid = pSessionKey->groupId;
+    item.skey = pSessionKey->win.skey;
+    item.eventType = SNOTIFY_EVENT_WINDOW_CLOSE;
+    SStreamNotifyEvent* pItem = taosHashGet(sup->pWindowEventHashMap, &item, NOTIFY_EVENT_KEY_SIZE);
+    if (pItem == NULL) {
+      item.pJson = createBasicAggNotifyEvent(sup->windowType, SNOTIFY_EVENT_WINDOW_CLOSE, pSessionKey);
+      QUERY_CHECK_NULL(item.pJson, code, lino, _end, terrno);
+      code = taosHashPut(sup->pWindowEventHashMap, &item, NOTIFY_EVENT_KEY_SIZE, &item, sizeof(SStreamNotifyEvent));
+      QUERY_CHECK_CODE(code, lino, _end);
+      item.pJson = NULL;
+      pItem = taosHashGet(sup->pWindowEventHashMap, &item, NOTIFY_EVENT_KEY_SIZE);
+      QUERY_CHECK_NULL(pItem, code, lino, _end, TSDB_CODE_INTERNAL_ERROR);
+    }
 
     // convert the result row into json
     result = cJSON_CreateObject();
     QUERY_CHECK_NULL(result, code, lino, _end, TSDB_CODE_OUT_OF_MEMORY);
     for (int32_t j = 0; j < pSchemaWrapper->nCols; ++j) {
-      SSchema*         pCol = pSchemaWrapper->pSchema + j;
-      SColumnInfoData* pColData = taosArrayGet(pResultBlock->pDataBlock, pCol->colId - 1);
+      const SSchema*         pCol = pSchemaWrapper->pSchema + j;
+      const SColumnInfoData* pColData = taosArrayGet(pResultBlock->pDataBlock, pCol->colId - 1);
       code = jsonAddColumnField(pCol->name, pColData->info.type, colDataIsNull_s(pColData, i),
                                 colDataGetData(pColData, i), result);
       QUERY_CHECK_CODE(code, lino, _end);
     }
-    JSON_CHECK_ADD_ITEM(event, "result", result);
+    JSON_CHECK_ADD_ITEM(pItem->pJson, "result", result);
     result = NULL;
-
-    item.gid = pResultBlock->info.id.groupId;
-    item.skey = *(uint64_t*)colDataGetNumData(pWstartCol, i);
-    item.content = cJSON_PrintUnformatted(event);
-    code = taosHashPut(sup->pResultHashMap, &item.gid, sizeof(item.gid) + sizeof(item.skey), &item, sizeof(item));
-    TSDB_CHECK_CODE(code, lino, _end);
-    item.content = NULL;
-
-    cJSON_Delete(event);
-    event = NULL;
   }
 
 _end:
@@ -632,8 +626,36 @@ _end:
   if (result != NULL) {
     cJSON_Delete(result);
   }
-  if (event != NULL) {
-    cJSON_Delete(event);
+  return code;
+}
+
+int32_t addAggDeleteNotifyEvent(const SSDataBlock* pDeleteBlock, SStreamNotifyEventSupp* sup) {
+  int32_t          code = TSDB_CODE_SUCCESS;
+  int32_t          lino = 0;
+  SSessionKey      sessionKey = {0};
+  SColumnInfoData* pWstartCol = NULL;
+  SColumnInfoData* pWendCol = NULL;
+  SColumnInfoData* pGroupIdCol = NULL;
+
+  QUERY_CHECK_NULL(pDeleteBlock, code, lino, _end, TSDB_CODE_INVALID_PARA);
+  QUERY_CHECK_NULL(sup, code, lino, _end, TSDB_CODE_INVALID_PARA);
+
+  qDebug("add %" PRId64 " stream notify delete events from window agg", pDeleteBlock->info.rows);
+
+  pWstartCol = taosArrayGet(pDeleteBlock->pDataBlock, START_TS_COLUMN_INDEX);
+  pWendCol = taosArrayGet(pDeleteBlock->pDataBlock, END_TS_COLUMN_INDEX);
+  pGroupIdCol = taosArrayGet(pDeleteBlock->pDataBlock, GROUPID_COLUMN_INDEX);
+  for (int32_t i = 0; i < pDeleteBlock->info.rows; ++i) {
+    sessionKey.win.skey = *(int64_t*)colDataGetNumData(pWstartCol, i);
+    sessionKey.win.ekey = *(int64_t*)colDataGetNumData(pWendCol, i);
+    sessionKey.groupId = *(uint64_t*)colDataGetNumData(pGroupIdCol, i);
+    code = addNormalAggNotifyEvent(SNOTIFY_EVENT_WINDOW_INVALIDATION, &sessionKey, sup);
+    QUERY_CHECK_CODE(code, lino, _end);
+  }
+
+_end:
+  if (code != TSDB_CODE_SUCCESS) {
+    qError("%s failed at line %d since %s", __func__, lino, tstrerror(code));
   }
   return code;
 }
@@ -673,119 +695,37 @@ _end:
   return code;
 }
 
-static int32_t streamNotifyFillTableName(const char* tableName, const SStreamNotifyEvent* pEvent,
-                                         const SStreamNotifyEvent* pResult, char** pVal) {
-  int32_t            code = TSDB_CODE_SUCCESS;
-  int32_t            lino = 0;
-  static const char* prefix = "{\"tableName\":\"";
-  uint64_t           prefixLen = 0;
-  uint64_t           nameLen = 0;
-  uint64_t           eventLen = 0;
-  uint64_t           resultLen = 0;
-  uint64_t           valLen = 0;
-  char*              val = NULL;
-  char*              p = NULL;
-
-  QUERY_CHECK_NULL(tableName, code, lino, _end, TSDB_CODE_INVALID_PARA);
-  QUERY_CHECK_NULL(pEvent, code, lino, _end, TSDB_CODE_INVALID_PARA);
-  QUERY_CHECK_NULL(pVal, code, lino, _end, TSDB_CODE_INVALID_PARA);
-
-  *pVal = NULL;
-  prefixLen = strlen(prefix);
-  nameLen = strlen(tableName);
-  eventLen = strlen(pEvent->content);
-
-  if (pResult != NULL) {
-    resultLen = strlen(pResult->content);
-    valLen = VARSTR_HEADER_SIZE + prefixLen + nameLen + eventLen + resultLen;
-  } else {
-    valLen = VARSTR_HEADER_SIZE + prefixLen + nameLen + eventLen + 1;
-  }
-  val = taosMemoryMalloc(valLen);
-  QUERY_CHECK_NULL(val, code, lino, _end, terrno);
-  varDataSetLen(val, valLen - VARSTR_HEADER_SIZE);
-
-  p = varDataVal(val);
-  TAOS_STRNCPY(p, prefix, prefixLen);
-  p += prefixLen;
-  TAOS_STRNCPY(p, tableName, nameLen);
-  p += nameLen;
-  *(p++) = '\"';
-  TAOS_STRNCPY(p, pEvent->content, eventLen);
-  *p = ',';
-
-  if (pResult != NULL) {
-    p += eventLen - 1;
-    TAOS_STRNCPY(p, pResult->content, resultLen);
-    *p = ',';
-  }
-  *pVal = val;
-  val = NULL;
-
-_end:
-  if (code != TSDB_CODE_SUCCESS) {
-    qError("%s failed at line %d since %s", __func__, lino, tstrerror(code));
-  }
-  if (val != NULL) {
-    taosMemoryFreeClear(val);
-  }
-  return code;
-}
-
 int32_t buildNotifyEventBlock(const SExecTaskInfo* pTaskInfo, SStreamNotifyEventSupp* sup) {
   int32_t          code = TSDB_CODE_SUCCESS;
   int32_t          lino = 0;
-  SArray*          nodeArray = NULL;
-  SListIter        iter = {0};
-  SListNode*       pNode = NULL;
   int32_t          nWindowEvents = 0;
-  int32_t          nWindowResults = 0;
   SColumnInfoData* pEventStrCol = NULL;
-  char*            val = NULL;
+  void*            pIter = NULL;
 
-  if (pTaskInfo == NULL || sup == NULL) {
+  if (pTaskInfo == NULL || sup == NULL || sup->pEventBlock == NULL) {
     goto _end;
   }
 
   QUERY_CHECK_NULL(sup->pEventBlock, code, lino, _end, TSDB_CODE_INVALID_PARA);
   blockDataCleanup(sup->pEventBlock);
-
-  // Filter out all events that can be pushed
-  nodeArray = taosArrayInit(listNEles(sup->pWindowEvents), POINTER_BYTES * 2);
-  QUERY_CHECK_NULL(nodeArray, code, lino, _end, terrno);
-  tdListInitIter(sup->pWindowEvents, &iter, TD_LIST_FORWARD);
-  while ((pNode = tdListNext(&iter)) != NULL) {
-    SStreamNotifyEvent* pEvent = (SStreamNotifyEvent*)pNode->data;
-    SStreamNotifyEvent* pResult = NULL;
-    if (pEvent->isEnd) {
-      pResult = taosHashGet(sup->pResultHashMap, pEvent, sizeof(pEvent->gid) + sizeof(pEvent->skey));
-      if (pResult == NULL) {
-        // due to stream watermark, current window cannot push agg result yet
-        continue;
-      }
-    }
-    SStreamNotifyEvent* ar[] = {pEvent, pResult};
-    void*               px = taosArrayPush(nodeArray, ar);
-    QUERY_CHECK_NULL(px, code, lino, _end, terrno);
-  }
-
-  nWindowEvents = taosArrayGetSize(nodeArray);
-  nWindowResults = taosHashGetSize(sup->pResultHashMap);
-  qDebug("start to build stream notify event block, nWindowEvents: %d, nWindowResults: %d", nWindowEvents,
-         nWindowResults);
-
-  code = blockDataEnsureCapacity(sup->pEventBlock, nWindowEvents);
-  QUERY_CHECK_CODE(code, lino, _end);
+  nWindowEvents = taosHashGetSize(sup->pWindowEventHashMap);
+  qDebug("start to build stream notify event block, nWindowEvents: %d", nWindowEvents);
 
   pEventStrCol = taosArrayGet(sup->pEventBlock->pDataBlock, NOTIFY_EVENT_STR_COLUMN_INDEX);
   QUERY_CHECK_NULL(pEventStrCol, code, lino, _end, terrno);
 
   // Append all events content into data block.
-  for (int32_t i = 0; i < nWindowEvents; ++i) {
-    SStreamNotifyEvent** ar = taosArrayGet(nodeArray, i);
-    SStreamNotifyEvent*  pEvent = ar[0];
-    SStreamNotifyEvent*  pResult = ar[1];
-    char*                tableName = taosHashGet(sup->pTableNameHashMap, &pEvent->gid, sizeof(pEvent->gid));
+  pIter = taosHashIterate(sup->pWindowEventHashMap, NULL);
+  while (pIter) {
+    const SStreamNotifyEvent* pEvent = (const SStreamNotifyEvent*)pIter;
+    pIter = taosHashIterate(sup->pWindowEventHashMap, pIter);
+    if (pEvent->eventType == SNOTIFY_EVENT_WINDOW_CLOSE && !cJSON_HasObjectItem(pEvent->pJson, "result")) {
+      // current WINDOW_CLOSE event cannot be pushed yet due to watermark
+      continue;
+    }
+
+    // get name of the dest child table
+    char* tableName = taosHashGet(sup->pTableNameHashMap, &pEvent->gid, sizeof(&pEvent->gid));
     if (tableName == NULL) {
       code = streamNotifyGetDestTableName(pTaskInfo, pEvent->gid, &tableName);
       QUERY_CHECK_CODE(code, lino, _end);
@@ -795,31 +735,25 @@ int32_t buildNotifyEventBlock(const SExecTaskInfo* pTaskInfo, SStreamNotifyEvent
       tableName = taosHashGet(sup->pTableNameHashMap, &pEvent->gid, sizeof(pEvent->gid));
       QUERY_CHECK_NULL(tableName, code, lino, _end, TSDB_CODE_INTERNAL_ERROR);
     }
-    code = streamNotifyFillTableName(tableName, pEvent, pResult, &val);
-    QUERY_CHECK_CODE(code, lino, _end);
-    code = colDataSetVal(pEventStrCol, sup->pEventBlock->info.rows, val, false);
+    JSON_CHECK_ADD_ITEM(pEvent->pJson, "tableName", cJSON_CreateStringReference(tableName));
+
+    // convert the json object into string and append it into the block
+    char* str = cJSON_PrintUnformatted(pEvent->pJson);
+    QUERY_CHECK_NULL(str, code, lino, _end, TSDB_CODE_OUT_OF_MEMORY);
+    int32_t len = strlen(str);
+    code = varColSetVarData(pEventStrCol, sup->pEventBlock->info.rows, str, len, false);
+    cJSON_free(str);
     QUERY_CHECK_CODE(code, lino, _end);
     sup->pEventBlock->info.rows++;
-    taosMemoryFreeClear(val);
-  }
-
-  // Clear all events that are to be pushed
-  for (int32_t i = 0; i < nWindowEvents; ++i) {
-    SStreamNotifyEvent** ar = taosArrayGet(nodeArray, i);
-    SStreamNotifyEvent*  pEvent = ar[0];
-    code = taosHashRemove(sup->pWindowEventHashMap, pEvent,
-                          sizeof(pEvent->gid) + sizeof(pEvent->skey) + sizeof(pEvent->isEnd));
-    if (code != TSDB_CODE_SUCCESS) {
-      qWarn("failed to remove window events in hash map since %s", tstrerror(code));
-      // ignore failure and go on to process.
+    code = taosHashRemove(sup->pWindowEventHashMap, pEvent, NOTIFY_EVENT_KEY_SIZE);
+    if (code == TSDB_CODE_NOT_FOUND) {
       code = TSDB_CODE_SUCCESS;
     }
-    pNode = listNode(pEvent);
-    pNode = tdListPopNode(sup->pWindowEvents, pNode);
-    destroyStreamWindowEvent(pEvent);
-    taosMemoryFreeClear(pNode);
+    QUERY_CHECK_CODE(code, lino, _end);
+    if (sup->pEventBlock->info.rows >= sup->pEventBlock->info.capacity) {
+      break;
+    }
   }
-  taosHashClear(sup->pResultHashMap);
 
   if (taosHashGetMemSize(sup->pTableNameHashMap) >= NOTIFY_EVENT_NAME_CACHE_LIMIT_MB * 1024 * 1024) {
     taosHashClear(sup->pTableNameHashMap);
@@ -829,12 +763,8 @@ _end:
   if (code != TSDB_CODE_SUCCESS) {
     qError("%s failed at line %d since %s", __func__, lino, tstrerror(code));
   }
-  if (val != NULL) {
-    taosMemoryFreeClear(val);
-  }
-  if (nodeArray != NULL) {
-    taosArrayDestroy(nodeArray);
-    nodeArray = NULL;
+  if (pIter) {
+    taosHashCancelIterate(sup->pWindowEventHashMap, pIter);
   }
   return code;
 }
